@@ -3,43 +3,102 @@ import matplotlib.pyplot as plt
 import os
 
 from gas_data import get_gas_properties
+from eos import calculate_eos_parameters
+
 
 R = 0.08314462618  # L.bar/(mol.K)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
 PLOT_DIR = os.path.join(BASE_DIR, "plots")
 
+EOS_NAMES = {
+    "PR": "Peng-Robinson",
+    "SRK": "Soave-Redlich-Kwong",
+    "RK": "Redlich-Kwong",
+    "VDW": "Van der Waals"
+}
 
-def calculate_pressure(T, V, a, b, alpha):
+EOS_MODELS = ["PR", "SRK", "RK", "VDW"]
 
-    aT = a * alpha
+
+# --------------------------------------------------
+# PRESSURE CALCULATION
+# --------------------------------------------------
+
+def calculate_pressure(T, V, parameters):
+
+    a = parameters["a"]
+    b = parameters["b"]
+
+    delta1 = parameters["delta1"]
+    delta2 = parameters["delta2"]
+
+    if np.any(np.asarray(V) <= b):
+        raise ValueError(
+            "Molar volume must be greater than b."
+        )
 
     P = (
-        (R * T) / (V - b)
-        - aT / (V**2 + 2*b*V - b**2)
+        R * T / (V - b)
+        - a / (
+            (V + delta1 * b)
+            * (V + delta2 * b)
+        )
     )
 
     return P
 
 
-def plot_pv_graph(gas_key):
+# --------------------------------------------------
+# CRITICAL VOLUME
+# --------------------------------------------------
 
-    properties = get_gas_properties(gas_key)
+def get_critical_volume(properties, eos_model):
 
     Tc = properties["Tc"]
     Pc = properties["Pc"]
-    omega = properties["omega"]
 
-    a = 0.45724 * (R**2 * Tc**2) / Pc
+    if eos_model == "PR":
+        Zc = 0.3074
 
-    b = 0.07780 * R * Tc / Pc
+    elif eos_model in ("SRK", "RK"):
+        Zc = 1.0 / 3.0
 
-    kappa = (
-        0.37464
-        + 1.54226 * omega
-        - 0.26992 * omega**2
-    )
+    elif eos_model == "VDW":
+        Zc = 3.0 / 8.0
+
+    else:
+        raise ValueError("Invalid EOS model.")
+
+    Vc = Zc * R * Tc / Pc
+
+    return Vc
+
+
+# --------------------------------------------------
+# CREATE PLOTS FOLDER
+# --------------------------------------------------
+
+def prepare_plot_folder():
+
+    os.makedirs(PLOT_DIR, exist_ok=True)
+
+
+# --------------------------------------------------
+# INDIVIDUAL EOS P-V GRAPH
+# --------------------------------------------------
+
+def plot_pv_graph(gas_key, eos_model="PR"):
+
+    properties = get_gas_properties(gas_key)
+
+    if eos_model not in EOS_NAMES:
+        raise ValueError(
+            "Choose PR, SRK, RK or VDW."
+        )
+
+    Tc = properties["Tc"]
+    Pc = properties["Pc"]
 
     temperatures = [
         0.85 * Tc,
@@ -55,89 +114,243 @@ def plot_pv_graph(gas_key):
 
     fig, ax = plt.subplots(figsize=(9, 6))
 
-    for T, label in zip(temperatures, labels):
+    try:
 
-        Tr = T / Tc
+        for temperature, label in zip(temperatures, labels):
 
-        alpha = (
-            1 + kappa * (1 - np.sqrt(Tr))
-        )**2
+            parameters = calculate_eos_parameters(
+                properties,
+                temperature,
+                1.0,
+                eos_model
+            )
 
-        V_min = 1.02 * b
+            b = parameters["b"]
 
-        V_max = 8 * R * T / Pc
+            V_min = 1.02 * b
+            V_max = 8 * R * temperature / Pc
 
-        V = np.linspace(V_min, V_max, 600)
+            V = np.linspace(
+                V_min,
+                V_max,
+                800
+            )
 
-        P = calculate_pressure(T, V, a, b, alpha)
+            pressure = calculate_pressure(
+                temperature,
+                V,
+                parameters
+            )
 
-        ax.plot(V, P, label=label)
+            ax.plot(
+                V,
+                pressure,
+                label=label
+            )
 
-    # Graph formatting
-        # Calculate and mark the critical point
-    Vc = 0.3074 * R * Tc / Pc
+        # Critical point
 
-    ax.scatter(
-        Vc,
-        Pc,
-        color="red",
-        marker="o",
-        s=90,
-        label="Critical Point",
-        zorder=5
+        Vc = get_critical_volume(
+            properties,
+            eos_model
+        )
+
+        ax.scatter(
+            Vc,
+            Pc,
+            color="red",
+            marker="o",
+            s=90,
+            label="Critical Point",
+            zorder=5
+        )
+
+        ax.annotate(
+            f"Critical Point\n"
+            f"(Pc = {Pc:.2f} bar, Vc = {Vc:.4f} L/mol)",
+            xy=(Vc, Pc),
+            xytext=(15, 15),
+            textcoords="offset points",
+            fontsize=9,
+            color="red",
+            arrowprops={
+                "arrowstyle": "->",
+                "color": "red"
+            }
+        )
+
+        # Graph formatting
+
+        ax.set_title(
+            f"P-V Isotherms for {properties['name']}\n"
+            f"using {EOS_NAMES[eos_model]} EOS"
+        )
+
+        ax.set_xlabel("Molar Volume (L/mol)")
+        ax.set_ylabel("Pressure (bar)")
+
+        ax.set_ylim(0, 3 * Pc)
+        ax.set_xlim(0, 4 * R * Tc / Pc)
+
+        ax.grid(True)
+        ax.legend()
+
+        fig.tight_layout()
+
+        prepare_plot_folder()
+
+        filename = os.path.join(
+            PLOT_DIR,
+            f"{gas_key}_{eos_model}_PV_graph.png"
+        )
+
+        fig.savefig(
+            filename,
+            dpi=300
+        )
+
+        return filename
+
+    finally:
+        plt.close(fig)
+
+
+# --------------------------------------------------
+# COMPARISON GRAPH: ALL FOUR EOS
+# --------------------------------------------------
+
+def plot_pv_comparison_graph(gas_key, temperature):
+
+    properties = get_gas_properties(gas_key)
+
+    if not np.isfinite(temperature) or temperature <= 0:
+        raise ValueError(
+            "Temperature must be greater than zero."
+        )
+
+    Pc = properties["Pc"]
+
+    # Calculate parameters for all four EOS
+
+    parameter_sets = {
+
+        model: calculate_eos_parameters(
+            properties,
+            temperature,
+            1.0,
+            model
+        )
+
+        for model in EOS_MODELS
+
+    }
+
+    largest_b = max(
+        params["b"]
+        for params in parameter_sets.values()
     )
 
-    ax.annotate(
-        f"Critical Point\n(Pc = {Pc:.2f} bar, Vc = {Vc:.4f} L/mol)",
-        xy=(Vc, Pc),
-        xytext=(15, 15),
-        textcoords="offset points",
-        fontsize=9,
-        color="red",
-        arrowprops=dict(arrowstyle="->", color="red")
+    V_min = 1.02 * largest_b
+
+    V_max = max(
+        8 * R * temperature / Pc,
+        12 * largest_b
     )
 
-    ax.set_title(
-        f"P-V Isotherms for {properties['name']} "
-        "using Peng-Robinson EOS"
+    volumes = np.linspace(
+        V_min,
+        V_max,
+        1200
     )
 
-    ax.set_xlabel("Molar Volume (L/mol)")
+    fig, ax = plt.subplots(figsize=(10, 6.5))
 
-    ax.set_ylabel("Pressure (bar)")
+    try:
 
-    ax.set_ylim(0, 3 * Pc)
+        for model in EOS_MODELS:
 
-    ax.set_xlim(0, 4 * R * Tc / Pc)
+            pressure = np.asarray(
+                calculate_pressure(
+                    temperature,
+                    volumes,
+                    parameter_sets[model]
+                ),
+                dtype=float
+            )
 
-    ax.grid(True)
+            pressure[~np.isfinite(pressure)] = np.nan
 
-    ax.legend()
+            pressure[pressure > 5 * Pc] = np.nan
 
-    fig.tight_layout()
+            ax.plot(
+                volumes,
+                pressure,
+                linewidth=2,
+                label=EOS_NAMES[model]
+            )
 
-    # Create plots folder if it does not exist
+        # Graph formatting
 
-    os.makedirs(PLOT_DIR, exist_ok=True)
+        ax.set_title(
+            f"EOS Comparison: {properties['name']} "
+            f"at {temperature:.2f} K"
+        )
 
-    # Save graph
+        ax.set_xlabel("Molar Volume (L/mol)")
+        ax.set_ylabel("Pressure (bar)")
 
-    filename = os.path.join(
-        PLOT_DIR,
-        f"{gas_key}_PV_graph.png"
-    )
+        ax.set_xlim(V_min, V_max)
+        ax.set_ylim(0, 3 * Pc)
 
-    fig.savefig(filename, dpi=300)
+        ax.grid(True, alpha=0.35)
+        ax.legend()
 
-    plt.close(fig)
+        fig.tight_layout()
 
-    print("\nGraph saved successfully at:", filename)
+        prepare_plot_folder()
 
-    return filename
+        filename = os.path.join(
+            PLOT_DIR,
+            f"{gas_key}_EOS_comparison_{temperature:.2f}K.png"
+        )
 
+        fig.savefig(
+            filename,
+            dpi=300
+        )
+
+        return filename
+
+    finally:
+        plt.close(fig)
+
+
+# --------------------------------------------------
+# TESTING
+# --------------------------------------------------
 
 if __name__ == "__main__":
 
     gas = "methane"
 
-    plot_pv_graph(gas)
+    for model in EOS_MODELS:
+
+        path = plot_pv_graph(
+            gas,
+            model
+        )
+
+        print(
+            "Graph saved successfully at:",
+            path
+        )
+
+    comparison_path = plot_pv_comparison_graph(
+        gas,
+        300.0
+    )
+
+    print(
+        "Comparison graph saved at:",
+        comparison_path
+    )
