@@ -3,20 +3,36 @@ import os
 import math
 import csv
 import io
+import pandas as pd
 
 from gas_data import get_gas_properties, get_available_gases
 from eos import calculate_pvt
 from enthalpy import calculate_enthalpy
 from entropy import calculate_entropy
 from fugacity import calculate_fugacity
-from graphs import plot_pv_graph
 
+from graphs import (
+    plot_pv_graph,
+    plot_pv_comparison_graph,
+    EOS_NAMES,
+    EOS_MODELS
+)
+
+
+# --------------------------------------------------
+# PAGE CONFIGURATION
+# --------------------------------------------------
 
 st.set_page_config(
     page_title="Real Gas Property Calculator",
     page_icon="⚗️",
     layout="wide"
 )
+
+
+# --------------------------------------------------
+# CUSTOM CSS
+# --------------------------------------------------
 
 st.markdown("""
 <style>
@@ -37,25 +53,326 @@ st.markdown("""
     border-radius: 10px;
 }
 
-.stButton > button {
+.stButton > button,
+.stDownloadButton > button {
     border-radius: 8px;
     font-weight: 600;
     min-height: 42px;
 }
 
-.stDownloadButton > button {
-    border-radius: 8px;
-    font-weight: 600;
-}
-
 </style>
 """, unsafe_allow_html=True)
+
+
+# --------------------------------------------------
+# SESSION STATE
+# Keeps results visible after Streamlit reruns
+# --------------------------------------------------
+
+for key in (
+    "single_results",
+    "comparison_results",
+    "single_graph_path",
+    "comparison_graph_path"
+):
+
+    if key not in st.session_state:
+        st.session_state[key] = None
+
+
+# --------------------------------------------------
+# EOS OPTIONS
+# --------------------------------------------------
+
+EOS_OPTIONS = {
+
+    "Peng-Robinson": "PR",
+
+    "Soave-Redlich-Kwong": "SRK",
+
+    "Redlich-Kwong": "RK",
+
+    "Van der Waals": "VDW"
+
+}
+
+
+# --------------------------------------------------
+# INPUT VALIDATION
+# --------------------------------------------------
+
+def validate_inputs(temperature, pressure):
+
+    if not math.isfinite(temperature) or not math.isfinite(pressure):
+
+        raise ValueError(
+            "Temperature and pressure must be finite."
+        )
+
+    if temperature <= 0:
+
+        raise ValueError(
+            "Temperature must be greater than zero."
+        )
+
+    if pressure <= 0:
+
+        raise ValueError(
+            "Pressure must be greater than zero."
+        )
+
+
+# --------------------------------------------------
+# AUTOMATIC PHASE SELECTION
+# --------------------------------------------------
+
+def resolve_phase(pvt, requested_phase):
+
+    if requested_phase != "Auto (Stable Phase)":
+
+        return requested_phase
+
+    stable = str(
+        pvt["stable_phase"]
+    ).lower()
+
+    if stable == "liquid":
+
+        return "liquid"
+
+    if stable in ("vapor", "single phase"):
+
+        return "vapor"
+
+    if stable == "vapor-liquid equilibrium":
+
+        return "vapor"
+
+    raise ValueError(
+        "The software could not determine the stable phase."
+    )
+
+
+# --------------------------------------------------
+# CALCULATE PROPERTIES FOR ONE EOS
+# --------------------------------------------------
+
+def calculate_model(
+    gas_key,
+    temperature,
+    pressure,
+    model,
+    requested_phase
+):
+
+    gas_properties = get_gas_properties(gas_key)
+
+    # PVT calculation
+
+    pvt = calculate_pvt(
+        gas_properties,
+        temperature,
+        pressure,
+        model
+    )
+
+    roots = pvt["roots"]
+
+    if len(roots) == 0:
+
+        raise ValueError(
+            f"{EOS_NAMES[model]}: "
+            "No valid real compressibility roots found."
+        )
+
+    pvt_values = [
+
+        pvt["Z_vapor"],
+        pvt["Z_liquid"],
+        pvt["V_vapor"],
+        pvt["V_liquid"]
+
+    ] + [
+        float(root) for root in roots
+    ]
+
+    if not all(
+        math.isfinite(float(value))
+        for value in pvt_values
+    ):
+
+        raise ValueError(
+            f"{EOS_NAMES[model]}: Invalid PVT values."
+        )
+
+    if (
+        pvt["V_vapor"] <= 0
+        or pvt["V_liquid"] <= 0
+    ):
+
+        raise ValueError(
+            f"{EOS_NAMES[model]}: "
+            "Molar volume is not positive."
+        )
+
+    # Determine selected phase
+
+    selected_phase = resolve_phase(
+        pvt,
+        requested_phase
+    )
+
+    # Enthalpy
+
+    enthalpy = calculate_enthalpy(
+        gas_key,
+        temperature,
+        pvt,
+        selected_phase,
+        model
+    )
+
+    # Entropy
+
+    entropy = calculate_entropy(
+        gas_key,
+        temperature,
+        pressure,
+        pvt,
+        selected_phase,
+        model
+    )
+
+    # Fugacity
+
+    fugacity = calculate_fugacity(
+        gas_key,
+        temperature,
+        pressure,
+        pvt,
+        selected_phase,
+        model
+    )
+
+    # Validate calculated properties
+
+    values = [
+
+        enthalpy["H_ideal"],
+        enthalpy["H_departure"],
+        enthalpy["H_total"],
+
+        entropy["S_ideal"],
+        entropy["S_departure"],
+        entropy["S_total"],
+
+        fugacity["phi"],
+        fugacity["fugacity"],
+        fugacity["ln_phi"]
+
+    ]
+
+    if not all(
+        math.isfinite(float(value))
+        for value in values
+    ):
+
+        raise ValueError(
+            f"{EOS_NAMES[model]}: "
+            "Invalid thermodynamic property."
+        )
+
+    if (
+        fugacity["phi"] <= 0
+        or fugacity["fugacity"] <= 0
+    ):
+
+        raise ValueError(
+            f"{EOS_NAMES[model]}: "
+            "Fugacity values must be positive."
+        )
+
+    return {
+
+        "gas_properties": gas_properties,
+
+        "model": model,
+
+        "pvt": pvt,
+
+        "enthalpy": enthalpy,
+
+        "entropy": entropy,
+
+        "fugacity": fugacity,
+
+        "selected_phase": selected_phase
+
+    }
+
+
+# --------------------------------------------------
+# CREATE EOS COMPARISON TABLE
+# --------------------------------------------------
+
+def make_comparison_dataframe(results):
+
+    rows = []
+
+    for model in EOS_MODELS:
+
+        item = results[model]
+
+        pvt = item["pvt"]
+
+        selected_phase = item["selected_phase"]
+
+        if selected_phase == "vapor":
+
+            z = pvt["Z_vapor"]
+
+            volume = pvt["V_vapor"]
+
+        else:
+
+            z = pvt["Z_liquid"]
+
+            volume = pvt["V_liquid"]
+
+        rows.append({
+
+            "Equation of State": EOS_NAMES[model],
+
+            "Selected Phase": selected_phase.capitalize(),
+
+            "Real Roots": len(pvt["roots"]),
+
+            "Compressibility Factor (Z)": z,
+
+            "Molar Volume (L/mol)": volume,
+
+            "Enthalpy (J/mol)": item["enthalpy"]["H_total"],
+
+            "Entropy (J/mol.K)": item["entropy"]["S_total"],
+
+            "Fugacity Coefficient": item["fugacity"]["phi"],
+
+            "Fugacity (bar)": item["fugacity"]["fugacity"]
+
+        })
+
+    return pd.DataFrame(rows)
+
+
+# --------------------------------------------------
+# APPLICATION TITLE
+# --------------------------------------------------
 
 st.title("⚗️ Real Gas Property Calculator")
 
 st.write(
-    "A thermodynamic property calculator based on "
-    "the Peng-Robinson Equation of State."
+    "A thermodynamic property calculator using "
+    "four cubic equations of state."
 )
 
 st.caption(
@@ -65,11 +382,19 @@ st.caption(
 
 st.divider()
 
+
+# --------------------------------------------------
+# SIDEBAR SETTINGS
+# --------------------------------------------------
+
 st.sidebar.title("Calculation Settings")
 
 st.sidebar.write(
     "Enter the operating conditions below."
 )
+
+
+# Gas selection
 
 gas_options = get_available_gases()
 
@@ -79,12 +404,28 @@ gas = st.sidebar.selectbox(
     format_func=lambda key: get_gas_properties(key)["name"]
 )
 
+
+# EOS selection
+
+eos_name = st.sidebar.selectbox(
+    "Select Equation of State",
+    list(EOS_OPTIONS.keys())
+)
+
+eos_model = EOS_OPTIONS[eos_name]
+
+
+# Temperature
+
 T = st.sidebar.number_input(
     "Temperature (K)",
     min_value=1.0,
     value=300.0,
     step=10.0
 )
+
+
+# Pressure
 
 P = st.sidebar.number_input(
     "Pressure (bar)",
@@ -93,12 +434,23 @@ P = st.sidebar.number_input(
     step=1.0
 )
 
+
+# Phase selection
+
 phase = st.sidebar.selectbox(
     "Select Phase",
-    ["vapor", "liquid", "Auto (Stable Phase)"]
+    [
+        "vapor",
+        "liquid",
+        "Auto (Stable Phase)"
+    ]
 )
 
+
 st.sidebar.divider()
+
+
+# Calculate button
 
 calculate_button = st.sidebar.button(
     "Calculate Properties",
@@ -106,499 +458,57 @@ calculate_button = st.sidebar.button(
     use_container_width=True
 )
 
-st.sidebar.caption(
-    "Model: Peng-Robinson EOS"
+
+# Compare button
+
+compare_button = st.sidebar.button(
+    "Compare All Four EOS",
+    use_container_width=True
 )
+
+
+st.sidebar.caption(
+    f"Selected Model: {eos_name}"
+)
+
+
+# --------------------------------------------------
+# SINGLE EOS CALCULATION
+# --------------------------------------------------
 
 if calculate_button:
 
     try:
 
-        if not math.isfinite(T) or not math.isfinite(P):
+        validate_inputs(T, P)
 
-            st.error(
-                "Temperature and pressure must be finite values."
-            )
-
-            st.stop()
-
-        if T <= 0:
-
-            st.error(
-                "Temperature must be greater than zero."
-            )
-
-            st.stop()
-
-        if P <= 0:
-
-            st.error(
-                "Pressure must be greater than zero."
-            )
-
-            st.stop()
-
-        gas_properties = get_gas_properties(gas)
-
-        if not gas_properties:
-
-            st.error("Gas properties could not be found.")
-
-            st.stop()
-
-        pvt_results = calculate_pvt(
-            gas_properties, T, P
+        result = calculate_model(
+            gas,
+            T,
+            P,
+            eos_model,
+            phase
         )
 
-        roots = pvt_results["roots"]
+        st.session_state.single_results = {
 
-        if len(roots) == 0:
+            "gas": gas,
 
-            st.error(
-                "No valid real compressibility roots were found. "
-                "Try different temperature and pressure conditions."
-            )
+            "T": T,
 
-            st.stop()
+            "P": P,
 
-        if not all(
-            math.isfinite(float(root))
-            for root in roots
-        ):
+            "requested_phase": phase,
 
-            st.error(
-                "Invalid compressibility roots were obtained."
-            )
+            "result": result
 
-            st.stop()
+        }
 
-        if (
-            not math.isfinite(pvt_results["Z_vapor"])
-            or not math.isfinite(pvt_results["Z_liquid"])
-            or not math.isfinite(pvt_results["V_vapor"])
-            or not math.isfinite(pvt_results["V_liquid"])
-        ):
+        st.session_state.single_graph_path = None
 
-            st.error(
-                "Invalid PVT properties were obtained. "
-                "Please try different operating conditions."
-            )
-
-            st.stop()
-
-        if (
-            pvt_results["V_vapor"] <= 0
-            or pvt_results["V_liquid"] <= 0
-        ):
-
-            st.error(
-                "Calculated molar volume is not physically valid."
-            )
-
-            st.stop()
-
-        if len(roots) == 1:
-
-            st.info(
-                "Only one valid real compressibility root was found. "
-                "The same root is used for both phase calculations."
-            )
-
-        else:
-
-            st.info(
-                f"{len(roots)} valid real compressibility roots were found. "
-                "The smallest root is liquid-like and the largest "
-                "root is vapor-like."
-            )
-
-
-        selected_phase = phase
-
-        if phase == "Auto (Stable Phase)":
-
-            stable_phase = pvt_results["stable_phase"].lower()
-
-            if stable_phase == "liquid":
-
-                selected_phase = "liquid"
-
-                st.info(
-                    "Automatic phase selection: Liquid"
-                )
-
-            elif stable_phase == "vapor":
-
-                selected_phase = "vapor"
-
-                st.info(
-                    "Automatic phase selection: Vapor"
-                )
-
-            elif stable_phase == "single phase":
-
-                selected_phase = "vapor"
-
-                st.info(
-                    "Automatic phase selection: Single phase. "
-                    "Only one valid real root exists."
-                )
-
-            elif stable_phase == "vapor-liquid equilibrium":
-
-                selected_phase = "vapor"
-
-                st.info(
-                    "Automatic phase selection: Vapor-Liquid Equilibrium. "
-                    "Both phases have approximately equal fugacity. "
-                    "Vapor root is used for displaying properties."
-                )
-
-            else:
-
-                st.error(
-                    "The software could not determine the stable phase."
-                )
-
-                st.stop()
-
-        enthalpy_results = calculate_enthalpy(
-            gas, T, pvt_results, selected_phase
+        st.success(
+            "Calculations completed successfully!"
         )
-
-        entropy_results = calculate_entropy(
-            gas, T, P, pvt_results, selected_phase
-        )
-
-        fugacity_results = calculate_fugacity(
-            gas, T, P, pvt_results, selected_phase
-        )
-
-        all_results = [
-            enthalpy_results["H_ideal"],
-            enthalpy_results["H_departure"],
-            enthalpy_results["H_total"],
-            entropy_results["S_ideal"],
-            entropy_results["S_departure"],
-            entropy_results["S_total"],
-            fugacity_results["phi"],
-            fugacity_results["fugacity"],
-            fugacity_results["ln_phi"]
-        ]
-
-        if not all(
-            math.isfinite(float(value))
-            for value in all_results
-        ):
-
-            st.error(
-                "One or more thermodynamic properties are invalid."
-            )
-
-            st.stop()
-
-        if (
-            fugacity_results["phi"] <= 0
-            or fugacity_results["fugacity"] <= 0
-        ):
-
-            st.error(
-                "Calculated fugacity or fugacity coefficient "
-                "is not physically valid."
-            )
-
-            st.stop()
-
-        csv_buffer = io.StringIO()
-        csv_writer = csv.writer(csv_buffer)
-
-        csv_writer.writerow(["Parameter", "Value"])
-
-        export_data = [
-
-            ["Gas", gas_properties["name"]],
-            ["Temperature (K)", T],
-            ["Pressure (bar)", P],
-            ["Selected Phase", selected_phase.capitalize()],
-            ["Predicted Stable Phase", pvt_results["stable_phase"]],
-
-            ["Vapor Compressibility Factor", pvt_results["Z_vapor"]],
-            ["Liquid Compressibility Factor", pvt_results["Z_liquid"]],
-
-            ["Vapor Molar Volume (L/mol)", pvt_results["V_vapor"]],
-            ["Liquid Molar Volume (L/mol)", pvt_results["V_liquid"]],
-
-            [
-                "Compressibility Roots",
-                ", ".join(
-                    f"{float(root):.8f}" for root in roots
-                )
-            ],
-
-            ["Ideal Gas Enthalpy (J/mol)", enthalpy_results["H_ideal"]],
-            ["Enthalpy Departure (J/mol)", enthalpy_results["H_departure"]],
-            ["Total Enthalpy (J/mol)", enthalpy_results["H_total"]],
-
-            ["Ideal Gas Entropy (J/mol.K)", entropy_results["S_ideal"]],
-            ["Entropy Departure (J/mol.K)", entropy_results["S_departure"]],
-            ["Total Entropy (J/mol.K)", entropy_results["S_total"]],
-
-            ["Fugacity Coefficient", fugacity_results["phi"]],
-            ["Fugacity (bar)", fugacity_results["fugacity"]],
-            ["Log Fugacity Coefficient", fugacity_results["ln_phi"]],
-
-            ["Liquid-like Fugacity Coefficient", pvt_results["phi_liquid"]],
-            ["Vapor-like Fugacity Coefficient", pvt_results["phi_vapor"]]
-
-        ]
-
-        for row in export_data:
-            csv_writer.writerow(row)
-
-        st.success("Calculations completed successfully!")
-
-        st.download_button(
-            label="Download Results (CSV)",
-            data=csv_buffer.getvalue(),
-            file_name=f"{gas}_results.csv",
-            mime="text/csv",
-            key="download_results"
-        )
-
-        tab1, tab2, tab3, tab4, tab5 = st.tabs([
-            "PVT Properties",
-            "Enthalpy",
-            "Entropy",
-            "Fugacity",
-            "Phase Analysis"
-        ])
-
-        with tab1:
-
-            st.subheader("PVT Properties")
-
-            col1, col2, col3 = st.columns(3)
-
-            col1.metric(
-                "Gas",
-                gas_properties["name"]
-            )
-
-            col2.metric(
-                "Temperature",
-                f"{T:.2f} K"
-            )
-
-            col3.metric(
-                "Pressure",
-                f"{P:.3f} bar"
-            )
-
-            st.divider()
-
-            if phase == "Auto (Stable Phase)":
-
-                if pvt_results["stable_phase"].lower() == "single phase":
-
-                    st.subheader(
-                        "Selected Phase: Auto → Single Phase"
-                    )
-
-                elif pvt_results["stable_phase"].lower() == "vapor-liquid equilibrium":
-
-                    st.subheader(
-                        "Selected Phase: Auto → Vapor-Liquid Equilibrium"
-                    )
-
-                else:
-
-                    st.subheader(
-                        f"Selected Phase: Auto → {selected_phase.capitalize()}"
-                    )
-
-            else:
-
-                st.subheader(
-                    f"Selected Phase: {selected_phase.capitalize()}"
-                )
-
-            selected_Z = pvt_results[
-                "Z_vapor" if selected_phase == "vapor" else "Z_liquid"
-            ]
-
-            selected_V = pvt_results[
-                "V_vapor" if selected_phase == "vapor" else "V_liquid"
-            ]
-
-            col1, col2 = st.columns(2)
-
-            col1.metric(
-                "Selected Compressibility Factor",
-                f"{selected_Z:.6f}"
-            )
-
-            col2.metric(
-                "Selected Molar Volume",
-                f"{selected_V:.6f} L/mol"
-            )
-
-            st.divider()
-
-            st.subheader("Phase-wise PVT Properties")
-
-            col1, col2 = st.columns(2)
-
-            with col1:
-
-                st.markdown("**Vapor-like Phase**")
-
-                st.metric(
-                    "Compressibility Factor",
-                    f"{pvt_results['Z_vapor']:.6f}"
-                )
-
-                st.metric(
-                    "Molar Volume",
-                    f"{pvt_results['V_vapor']:.6f} L/mol"
-                )
-
-            with col2:
-
-                st.markdown("**Liquid-like Phase**")
-
-                st.metric(
-                    "Compressibility Factor",
-                    f"{pvt_results['Z_liquid']:.6f}"
-                )
-
-                st.metric(
-                    "Molar Volume",
-                    f"{pvt_results['V_liquid']:.6f} L/mol"
-                )
-
-            st.divider()
-
-            st.markdown("**Compressibility Roots**")
-
-            st.write([
-                round(float(root), 8)
-                for root in roots
-            ])
-
-        with tab2:
-
-            st.subheader("Enthalpy")
-
-            st.caption(
-                "Enthalpy is calculated using ideal-gas "
-                "and departure contributions."
-            )
-
-            col1, col2, col3 = st.columns(3)
-
-            col1.metric(
-                "Ideal Gas Enthalpy",
-                f"{enthalpy_results['H_ideal']:.4f} J/mol"
-            )
-
-            col2.metric(
-                "Enthalpy Departure",
-                f"{enthalpy_results['H_departure']:.4f} J/mol"
-            )
-
-            col3.metric(
-                "Total Enthalpy",
-                f"{enthalpy_results['H_total']:.4f} J/mol"
-            )
-
-        with tab3:
-
-            st.subheader("Entropy")
-
-            st.caption(
-                "Entropy is calculated using ideal-gas "
-                "and departure contributions."
-            )
-
-            col1, col2, col3 = st.columns(3)
-
-            col1.metric(
-                "Ideal Gas Entropy",
-                f"{entropy_results['S_ideal']:.4f} J/(mol.K)"
-            )
-
-            col2.metric(
-                "Entropy Departure",
-                f"{entropy_results['S_departure']:.4f} J/(mol.K)"
-            )
-
-            col3.metric(
-                "Total Entropy",
-                f"{entropy_results['S_total']:.4f} J/(mol.K)"
-            )
-
-        with tab4:
-
-            st.subheader("Pure Component Fugacity")
-
-            col1, col2 = st.columns(2)
-
-            col1.metric(
-                "Fugacity Coefficient",
-                f"{fugacity_results['phi']:.6f}"
-            )
-
-            col2.metric(
-                "Fugacity",
-                f"{fugacity_results['fugacity']:.6f} bar"
-            )
-
-            st.divider()
-
-            st.metric(
-                "Log Fugacity Coefficient",
-                f"{fugacity_results['ln_phi']:.6f}"
-            )
-
-        with tab5:
-
-            st.subheader("Phase Stability Analysis")
-
-            st.write(
-                f"**Predicted Stable Phase:** "
-                f"{pvt_results['stable_phase'].capitalize()}"
-            )
-
-            st.info(
-                pvt_results["stability_message"]
-            )
-
-            st.divider()
-
-            if pvt_results["phi_liquid"] is not None:
-
-                col1, col2 = st.columns(2)
-
-                col1.metric(
-                    "Liquid-like Fugacity Coefficient",
-                    f"{pvt_results['phi_liquid']:.6f}"
-                )
-
-                col2.metric(
-                    "Vapor-like Fugacity Coefficient",
-                    f"{pvt_results['phi_vapor']:.6f}"
-                )
-
-            st.divider()
-
-            st.markdown("**Compressibility Roots**")
-
-            for i, root in enumerate(roots, start=1):
-
-                st.write(
-                    f"Root {i}: {float(root):.8f}"
-                )
-
 
     except Exception as error:
 
@@ -608,41 +518,542 @@ if calculate_button:
 
         st.exception(error)
 
+
+# --------------------------------------------------
+# COMPARE ALL FOUR EOS
+# --------------------------------------------------
+
+if compare_button:
+
+    try:
+
+        validate_inputs(T, P)
+
+        results = {}
+
+        for model in EOS_MODELS:
+
+            results[model] = calculate_model(
+                gas,
+                T,
+                P,
+                model,
+                phase
+            )
+
+        st.session_state.comparison_results = {
+
+            "gas": gas,
+
+            "T": T,
+
+            "P": P,
+
+            "requested_phase": phase,
+
+            "results": results,
+
+            "table": make_comparison_dataframe(results)
+
+        }
+
+        st.session_state.comparison_graph_path = None
+
+        st.success(
+            "All four EOS models were calculated successfully!"
+        )
+
+    except Exception as error:
+
+        st.error(
+            f"Comparison error: {error}"
+        )
+
+        st.exception(error)
+
+
+# --------------------------------------------------
+# DISPLAY SINGLE EOS RESULTS
+# --------------------------------------------------
+
+saved = st.session_state.single_results
+
+if saved is not None:
+
+    result = saved["result"]
+
+    pvt = result["pvt"]
+
+    h = result["enthalpy"]
+
+    s = result["entropy"]
+
+    f = result["fugacity"]
+
+    roots = pvt["roots"]
+
+    selected_phase = result["selected_phase"]
+
+    gas_properties = result["gas_properties"]
+
+
+    st.header("Single EOS Calculation")
+
+    st.caption(
+        f"{EOS_NAMES[result['model']]} | "
+        f"{gas_properties['name']} | "
+        f"{saved['T']:.2f} K | "
+        f"{saved['P']:.3f} bar"
+    )
+
+
+    if len(roots) == 1:
+
+        st.info(
+            "Only one valid real compressibility root was found. "
+            "The same root is used for both phase-wise displays."
+        )
+
+    else:
+
+        st.info(
+            f"{len(roots)} valid real compressibility roots were found. "
+            "The smallest root is liquid-like and the largest "
+            "root is vapor-like."
+        )
+
+
+    if saved["requested_phase"] == "Auto (Stable Phase)":
+
+        st.info(
+            f"Automatic phase selection: "
+            f"{selected_phase.capitalize()}. "
+            f"Stability result: {pvt['stable_phase']}."
+        )
+
+
+    # CSV EXPORT
+
+    csv_buffer = io.StringIO()
+
+    writer = csv.writer(csv_buffer)
+
+    writer.writerow([
+        "Parameter",
+        "Value"
+    ])
+
+    export_rows = [
+
+        ["Gas", gas_properties["name"]],
+
+        ["Equation of State", EOS_NAMES[result["model"]]],
+
+        ["Temperature (K)", saved["T"]],
+
+        ["Pressure (bar)", saved["P"]],
+
+        ["Selected Phase", selected_phase.capitalize()],
+
+        ["Predicted Stable Phase", pvt["stable_phase"]],
+
+        ["Vapor Compressibility Factor", pvt["Z_vapor"]],
+
+        ["Liquid Compressibility Factor", pvt["Z_liquid"]],
+
+        ["Vapor Molar Volume (L/mol)", pvt["V_vapor"]],
+
+        ["Liquid Molar Volume (L/mol)", pvt["V_liquid"]],
+
+        [
+            "Compressibility Roots",
+            ", ".join(
+                f"{float(x):.8f}"
+                for x in roots
+            )
+        ],
+
+        ["Ideal Gas Enthalpy (J/mol)", h["H_ideal"]],
+
+        ["Enthalpy Departure (J/mol)", h["H_departure"]],
+
+        ["Total Enthalpy (J/mol)", h["H_total"]],
+
+        ["Ideal Gas Entropy (J/mol.K)", s["S_ideal"]],
+
+        ["Entropy Departure (J/mol.K)", s["S_departure"]],
+
+        ["Total Entropy (J/mol.K)", s["S_total"]],
+
+        ["Fugacity Coefficient", f["phi"]],
+
+        ["Fugacity (bar)", f["fugacity"]],
+
+        ["Log Fugacity Coefficient", f["ln_phi"]]
+
+    ]
+
+    for row in export_rows:
+
+        writer.writerow(row)
+
+
+    st.download_button(
+        "Download Results (CSV)",
+        data=csv_buffer.getvalue(),
+        file_name=f"{saved['gas']}_{result['model']}_results.csv",
+        mime="text/csv",
+        key="download_single_results"
+    )
+
+
+    # RESULT TABS
+
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+
+        "PVT Properties",
+
+        "Enthalpy",
+
+        "Entropy",
+
+        "Fugacity",
+
+        "Phase Analysis"
+
+    ])
+
+
+    # PVT TAB
+
+    with tab1:
+
+        st.subheader("PVT Properties")
+
+        c1, c2, c3 = st.columns(3)
+
+        c1.metric(
+            "Gas",
+            gas_properties["name"]
+        )
+
+        c2.metric(
+            "Temperature",
+            f"{saved['T']:.2f} K"
+        )
+
+        c3.metric(
+            "Pressure",
+            f"{saved['P']:.3f} bar"
+        )
+
+
+        st.write(
+            f"**Selected Phase:** {selected_phase.capitalize()}"
+        )
+
+
+        if selected_phase == "vapor":
+
+            z = pvt["Z_vapor"]
+
+            v = pvt["V_vapor"]
+
+        else:
+
+            z = pvt["Z_liquid"]
+
+            v = pvt["V_liquid"]
+
+
+        c1, c2 = st.columns(2)
+
+        c1.metric(
+            "Selected Compressibility Factor",
+            f"{z:.6f}"
+        )
+
+        c2.metric(
+            "Selected Molar Volume",
+            f"{v:.6f} L/mol"
+        )
+
+
+        st.subheader("Phase-wise PVT Properties")
+
+        c1, c2 = st.columns(2)
+
+
+        with c1:
+
+            st.markdown("**Vapor-like Phase**")
+
+            st.metric(
+                "Compressibility Factor",
+                f"{pvt['Z_vapor']:.6f}"
+            )
+
+            st.metric(
+                "Molar Volume",
+                f"{pvt['V_vapor']:.6f} L/mol"
+            )
+
+
+        with c2:
+
+            st.markdown("**Liquid-like Phase**")
+
+            st.metric(
+                "Compressibility Factor",
+                f"{pvt['Z_liquid']:.6f}"
+            )
+
+            st.metric(
+                "Molar Volume",
+                f"{pvt['V_liquid']:.6f} L/mol"
+            )
+
+
+        st.write("**Compressibility Roots**")
+
+        st.write([
+            round(float(root), 8)
+            for root in roots
+        ])
+
+
+    # ENTHALPY TAB
+
+    with tab2:
+
+        st.subheader("Enthalpy")
+
+        c1, c2, c3 = st.columns(3)
+
+        c1.metric(
+            "Ideal Gas Enthalpy",
+            f"{h['H_ideal']:.4f} J/mol"
+        )
+
+        c2.metric(
+            "Enthalpy Departure",
+            f"{h['H_departure']:.4f} J/mol"
+        )
+
+        c3.metric(
+            "Total Enthalpy",
+            f"{h['H_total']:.4f} J/mol"
+        )
+
+
+    # ENTROPY TAB
+
+    with tab3:
+
+        st.subheader("Entropy")
+
+        c1, c2, c3 = st.columns(3)
+
+        c1.metric(
+            "Ideal Gas Entropy",
+            f"{s['S_ideal']:.4f} J/(mol.K)"
+        )
+
+        c2.metric(
+            "Entropy Departure",
+            f"{s['S_departure']:.4f} J/(mol.K)"
+        )
+
+        c3.metric(
+            "Total Entropy",
+            f"{s['S_total']:.4f} J/(mol.K)"
+        )
+
+
+    # FUGACITY TAB
+
+    with tab4:
+
+        st.subheader("Pure Component Fugacity")
+
+        c1, c2 = st.columns(2)
+
+        c1.metric(
+            "Fugacity Coefficient",
+            f"{f['phi']:.6f}"
+        )
+
+        c2.metric(
+            "Fugacity",
+            f"{f['fugacity']:.6f} bar"
+        )
+
+        st.metric(
+            "Log Fugacity Coefficient",
+            f"{f['ln_phi']:.6f}"
+        )
+
+
+    # PHASE ANALYSIS TAB
+
+    with tab5:
+
+        st.subheader("Phase Stability Analysis")
+
+        st.write(
+            f"**Predicted Stable Phase:** "
+            f"{pvt['stable_phase'].capitalize()}"
+        )
+
+        st.info(
+            pvt["stability_message"]
+        )
+
+        c1, c2 = st.columns(2)
+
+        c1.metric(
+            "Liquid-like Fugacity Coefficient",
+            f"{pvt['phi_liquid']:.6f}"
+        )
+
+        c2.metric(
+            "Vapor-like Fugacity Coefficient",
+            f"{pvt['phi_vapor']:.6f}"
+        )
+
+        for index, root in enumerate(roots, start=1):
+
+            st.write(
+                f"Root {index}: {float(root):.8f}"
+            )
+
+
+# --------------------------------------------------
+# EOS COMPARISON TABLE
+# --------------------------------------------------
+
+st.divider()
+
+st.header("EOS Comparison")
+
+st.write(
+    "Compare all four equations of state using the same gas, "
+    "temperature, pressure and phase-selection setting."
+)
+
+
+comparison = st.session_state.comparison_results
+
+
+if comparison is not None:
+
+    st.caption(
+        f"{get_gas_properties(comparison['gas'])['name']} | "
+        f"{comparison['T']:.2f} K | "
+        f"{comparison['P']:.3f} bar | "
+        f"Requested phase: {comparison['requested_phase']}"
+    )
+
+
+    st.dataframe(
+
+        comparison["table"].style.format({
+
+            "Compressibility Factor (Z)": "{:.6f}",
+
+            "Molar Volume (L/mol)": "{:.6f}",
+
+            "Enthalpy (J/mol)": "{:.4f}",
+
+            "Entropy (J/mol.K)": "{:.4f}",
+
+            "Fugacity Coefficient": "{:.6f}",
+
+            "Fugacity (bar)": "{:.6f}"
+
+        }),
+
+        use_container_width=True,
+
+        hide_index=True
+
+    )
+
+
+    st.download_button(
+
+        "Download EOS Comparison (CSV)",
+
+        data=comparison["table"].to_csv(index=False),
+
+        file_name=f"{comparison['gas']}_EOS_comparison.csv",
+
+        mime="text/csv",
+
+        key="download_comparison"
+
+    )
+
+
+    with st.expander(
+        "View phase and root details for each EOS"
+    ):
+
+        for model in EOS_MODELS:
+
+            item = comparison["results"][model]
+
+            st.markdown(
+                f"**{EOS_NAMES[model]}**"
+            )
+
+            st.write(
+                f"Predicted stable phase: "
+                f"{item['pvt']['stable_phase']}"
+            )
+
+            st.write(
+                "Compressibility roots: "
+                + ", ".join(
+                    f"{float(root):.8f}"
+                    for root in item["pvt"]["roots"]
+                )
+            )
+
+
+# --------------------------------------------------
+# INDIVIDUAL EOS P-V GRAPH
+# --------------------------------------------------
+
 st.divider()
 
 st.header("P–V Isotherms")
 
 st.write(
-    "Generate pressure-volume isotherms "
-    "for the selected gas using the Peng-Robinson EOS."
+    f"Generate three temperature isotherms for "
+    f"{get_gas_properties(gas)['name']} "
+    f"using the {eos_name} Equation of State."
 )
+
+
 
 if st.button(
     "Generate P-V Graph",
-    use_container_width=False
+    key="generate_single_graph"
 ):
 
     try:
 
-        graph_path = plot_pv_graph(gas)
+        graph_path = plot_pv_graph(
+            gas,
+            eos_model
+        )
 
-        if os.path.exists(graph_path):
-
-            st.image(
-                graph_path,
-                caption=f"P-V Isotherms for {gas}",
-                use_container_width=True
-            )
-
-            st.success(
-                "Graph generated successfully!"
-            )
-
-        else:
-
-            st.warning(
-                "Graph file was not found."
-            )
+        st.session_state.single_graph_path = {
+            "path": graph_path,
+            "gas": gas,
+            "model": eos_model
+        }
 
     except Exception as error:
 
@@ -650,9 +1061,130 @@ if st.button(
             f"Graph generation error: {error}"
         )
 
+
+single_graph = st.session_state.single_graph_path
+
+
+if isinstance(single_graph, dict):
+
+    graph_path = single_graph["path"]
+
+    if os.path.exists(graph_path):
+
+        graph_gas = get_gas_properties(
+            single_graph["gas"]
+        )
+
+        graph_model = single_graph["model"]
+
+        st.image(
+            graph_path,
+            caption=(
+                f"P-V Isotherms for "
+                f"{graph_gas['name']} "
+                f"using {EOS_NAMES[graph_model]} EOS"
+            ),
+            use_container_width=True
+        )
+
+        st.success(
+            "Graph generated successfully."
+        )
+
+    else:
+
+        st.warning(
+            "The graph file could not be found."
+        )
+
+
+
+# --------------------------------------------------
+# FOUR-EOS P-V GRAPH COMPARISON
+# --------------------------------------------------
+
+st.divider()
+
+st.header(
+    "P–V Graph: Comparison of All Four EOS"
+)
+
+st.write(
+    "Compare the pressure-volume curves of PR, SRK, RK "
+    "and VDW at the same gas and temperature."
+)
+
+
+
+if st.button(
+    "Generate Four-EOS Comparison Graph",
+    key="generate_comparison_graph"
+):
+
+    try:
+
+        graph_path = plot_pv_comparison_graph(
+            gas,
+            T
+        )
+
+        st.session_state.comparison_graph_path = {
+            "path": graph_path,
+            "gas": gas,
+            "temperature": T
+        }
+
+    except Exception as error:
+
+        st.error(
+            f"Comparison graph error: {error}"
+        )
+
+
+comparison_graph = st.session_state.comparison_graph_path
+
+
+if isinstance(comparison_graph, dict):
+
+    graph_path = comparison_graph["path"]
+
+    if os.path.exists(graph_path):
+
+        graph_gas = get_gas_properties(
+            comparison_graph["gas"]
+        )
+
+        graph_temperature = comparison_graph["temperature"]
+
+        st.image(
+            graph_path,
+            caption=(
+                f"Four-EOS P-V comparison for "
+                f"{graph_gas['name']} "
+                f"at {graph_temperature:.2f} K"
+            ),
+            use_container_width=True
+        )
+
+        st.success(
+            "Four-EOS comparison graph generated successfully."
+        )
+
+    else:
+
+        st.warning(
+            "The comparison graph file could not be found."
+        )
+
+
+
+# --------------------------------------------------
+# FOOTER
+# --------------------------------------------------
+
 st.divider()
 
 st.caption(
     "Real Gas Property Calculator | "
-    "Peng-Robinson Equation of State"
+    "Peng-Robinson | SRK | RK | Van der Waals"
 )
