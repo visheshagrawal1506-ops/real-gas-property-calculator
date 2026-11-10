@@ -1,3 +1,4 @@
+
 import math
 import numpy as np
 
@@ -8,71 +9,110 @@ from gas_data import (
     H_REFERENCE
 )
 
+# Gas constant in L.bar/(mol.K)
 R = 0.08314462618
 
+# Gas constant in J/(mol.K)
+R_J = 8.314462618
+
+# Conversion: 1 L.bar = 100 J
 CONVERSION_FACTOR = 100.0
 
-def calculate_daT_dT(gas, T, a, kappa):
 
-    properties = get_gas_properties(gas)
+def get_gas_data(gas):
 
-    Tc = properties["Tc"]
+    if isinstance(gas, dict):
+        return gas
 
-    g = 1 + kappa * (1 - math.sqrt(T / Tc))
+    return get_gas_properties(gas)
 
-    dalpha_dT = -kappa * g / math.sqrt(T * Tc)
-
-    daT_dT = a * dalpha_dT
-
-    return daT_dT
 
 def calculate_ideal_enthalpy(gas, T):
 
-    properties = get_gas_properties(gas)
+    properties = get_gas_data(gas)
 
     Cp = properties["Cp_ig"]
 
     T_ref = REFERENCE_TEMPERATURE
-
     H_ref = H_REFERENCE
 
     # Constant heat capacity approximation
-
     H_ideal = H_ref + Cp * (T - T_ref)
 
     return H_ideal
 
+
+def get_selected_phase(pvt_results, phase):
+
+    phase = str(phase).strip().lower()
+
+    if phase in ("vapor", "vapour"):
+        return "vapor"
+
+    if phase == "liquid":
+        return "liquid"
+
+    if phase in (
+        "auto",
+        "auto (stable phase)",
+        "stable",
+        "single phase"
+    ):
+        stable_phase = pvt_results["stable_phase"].lower()
+
+        if stable_phase == "liquid":
+            return "liquid"
+
+        # For vapor-liquid equilibrium, use the vapor root
+        # as the default for automatic enthalpy calculation.
+        return "vapor"
+
+    raise ValueError(
+        "Phase must be vapor, liquid or Auto (Stable Phase)."
+    )
+
+
 def calculate_enthalpy_departure(
-    gas, T, pvt_results, phase="vapor"
+    gas, T, pvt_results, phase="vapor", eos_model="PR"
 ):
 
     parameters = pvt_results["parameters"]
 
     a = parameters["a"]
     b = parameters["b"]
-    alpha = parameters["alpha"]
-    kappa = parameters["kappa"]
+    da_dT = parameters["da_dT"]
+
     B = parameters["B"]
 
-    if phase == "vapor":
-        Z = pvt_results["Z_vapor"]
+    delta1 = parameters["delta1"]
+    delta2 = parameters["delta2"]
 
-    elif phase == "liquid":
+    selected_phase = get_selected_phase(
+        pvt_results, phase
+    )
+
+    if selected_phase == "vapor":
+        Z = pvt_results["Z_vapor"]
+    else:
         Z = pvt_results["Z_liquid"]
 
-    else:
-        raise ValueError(
-            "Phase must be 'vapor' or 'liquid'."
-        )
+    # First contribution to enthalpy departure
+    H_first = R_J * T * (Z - 1)
 
-    aT = a * alpha
+    # Special expression for Van der Waals EOS
+    if abs(delta1 - delta2) < 1e-12:
 
-    daT_dT = calculate_daT_dT(
-        gas, T, a, kappa
-    )
-    numerator = Z + (1 + np.sqrt(2)) * B
+        V = pvt_results["V_vapor"] if selected_phase == "vapor" else pvt_results["V_liquid"]
 
-    denominator = Z + (1 - np.sqrt(2)) * B
+        H_attraction = -CONVERSION_FACTOR * a / V
+
+        H_departure = H_first + H_attraction
+
+        return H_departure
+
+    # General expression for PR, SRK and RK
+    numerator = Z + delta1 * B
+    denominator = Z + delta2 * B
 
     if numerator <= 0 or denominator <= 0:
         raise ValueError(
@@ -81,30 +121,35 @@ def calculate_enthalpy_departure(
 
     log_term = np.log(numerator / denominator)
 
-    H_departure_Lbar = (
-        R * T * (Z - 1)
-        +
-        (
-            T * daT_dT - aT
-        ) / (2 * np.sqrt(2) * b) * log_term
+    H_attraction = (
+        CONVERSION_FACTOR
+        * (T * da_dT - a)
+        / (b * (delta1 - delta2))
+        * log_term
     )
 
-    H_departure = (
-        H_departure_Lbar * CONVERSION_FACTOR
-    )
+    H_departure = H_first + H_attraction
 
     return H_departure
 
+
 def calculate_enthalpy(
-    gas, T, pvt_results, phase="vapor"
+    gas, T, pvt_results, phase="vapor", eos_model="PR"
 ):
+
+    if T <= 0:
+        raise ValueError("Temperature must be positive.")
 
     H_ideal = calculate_ideal_enthalpy(
         gas, T
     )
 
     H_departure = calculate_enthalpy_departure(
-        gas, T, pvt_results, phase
+        gas,
+        T,
+        pvt_results,
+        phase,
+        eos_model
     )
 
     H_total = H_ideal + H_departure
@@ -114,6 +159,8 @@ def calculate_enthalpy(
         "H_departure": H_departure,
         "H_total": H_total
     }
+
+
 if __name__ == "__main__":
 
     gas = get_gas_properties("methane")
@@ -121,39 +168,46 @@ if __name__ == "__main__":
     T = 300.0
     P = 50.0
 
-    pvt_results = calculate_pvt(
-        gas, T, P
-    )
+    eos_models = ["PR", "SRK", "RK", "VDW"]
 
-    results = calculate_enthalpy(
-        gas, T, pvt_results
-    )
+    for model in eos_models:
 
-    print("\n================================")
-    print("ENTHALPY CALCULATION")
-    print("================================")
+        pvt_results = calculate_pvt(
+            gas, T, P, model
+        )
 
-    print("\nGas:", gas["name"])
+        results = calculate_enthalpy(
+            gas,
+            T,
+            pvt_results,
+            phase="vapor",
+            eos_model=model
+        )
 
-    print("Temperature:", T, "K")
-    print("Pressure:", P, "bar")
+        print("\n================================")
+        print(model, "ENTHALPY CALCULATION")
+        print("================================")
 
-    print("\nIDEAL GAS ENTHALPY")
+        print("\nGas:", gas["name"])
+        print("Temperature:", T, "K")
+        print("Pressure:", P, "bar")
 
-    print(
-        f"H ideal = {results['H_ideal']:.4f} J/mol"
-    )
+        print("\nIDEAL GAS ENTHALPY")
 
-    print("\nENTHALPY DEPARTURE")
+        print(
+            f"H ideal = {results['H_ideal']:.4f} J/mol"
+        )
 
-    print(
-        f"H departure = {results['H_departure']:.4f} J/mol"
-    )
+        print("\nENTHALPY DEPARTURE")
 
-    print("\nTOTAL REAL GAS ENTHALPY")
+        print(
+            f"H departure = {results['H_departure']:.4f} J/mol"
+        )
 
-    print(
-        f"H total = {results['H_total']:.4f} J/mol"
-    )
+        print("\nTOTAL REAL GAS ENTHALPY")
 
-    print("\n================================")
+        print(
+            f"H total = {results['H_total']:.4f} J/mol"
+        )
+
+        print("\n================================")
