@@ -1,5 +1,6 @@
-import numpy as np
+
 import math
+import numpy as np
 
 from eos import calculate_pvt
 from gas_data import (
@@ -9,26 +10,27 @@ from gas_data import (
     S_REFERENCE
 )
 
+# Gas constants
 R_BAR = 0.08314462618       # L.bar/(mol.K)
 R_J = 8.314462618           # J/(mol.K)
 
-def calculate_daT_dT(gas, T, a, kappa):
 
-    properties = get_gas_properties(gas)
+def get_gas_data(gas):
 
-    Tc = properties["Tc"]
+    if isinstance(gas, dict):
+        return gas
 
-    g = 1 + kappa * (1 - math.sqrt(T / Tc))
+    return get_gas_properties(gas)
 
-    dalpha_dT = -kappa * g / math.sqrt(T * Tc)
-
-    daT_dT = a * dalpha_dT
-
-    return daT_dT
 
 def calculate_ideal_entropy(gas, T, P):
 
-    properties = get_gas_properties(gas)
+    if T <= 0 or P <= 0:
+        raise ValueError(
+            "Temperature and pressure must be positive."
+        )
+
+    properties = get_gas_data(gas)
 
     Cp = properties["Cp_ig"]
 
@@ -40,52 +42,117 @@ def calculate_ideal_entropy(gas, T, P):
 
     return S_ideal
 
-def calculate_entropy_departure(gas, T, P, pvt_results, phase="vapor"):
+
+def get_selected_phase(pvt_results, phase):
+
+    phase = str(phase).strip().lower()
+
+    if phase in ("vapor", "vapour"):
+        return "vapor"
+
+    if phase == "liquid":
+        return "liquid"
+
+    if phase in (
+        "auto",
+        "auto (stable phase)",
+        "stable",
+        "single phase"
+    ):
+
+        stable_phase = pvt_results["stable_phase"].lower()
+
+        if stable_phase == "liquid":
+            return "liquid"
+
+        # Use the vapor-like root by default at equilibrium
+        # or when only one root exists.
+        return "vapor"
+
+    raise ValueError(
+        "Phase must be vapor, liquid or Auto (Stable Phase)."
+    )
+
+
+def calculate_entropy_departure(
+    gas, T, P, pvt_results, phase="vapor", eos_model="PR"
+):
 
     parameters = pvt_results["parameters"]
 
-    a = parameters["a"]
     b = parameters["b"]
-    alpha = parameters["alpha"]
-    kappa = parameters["kappa"]
+    da_dT = parameters["da_dT"]
     B = parameters["B"]
 
-    aT = a * alpha
+    delta1 = parameters["delta1"]
+    delta2 = parameters["delta2"]
 
-    daT_dT = calculate_daT_dT(gas, T, a, kappa)
+    selected_phase = get_selected_phase(
+        pvt_results, phase
+    )
 
-    if phase == "vapor":
+    if selected_phase == "vapor":
         Z = pvt_results["Z_vapor"]
-
-    elif phase == "liquid":
+    else:
         Z = pvt_results["Z_liquid"]
 
-    else:
-        raise ValueError("Phase must be 'vapor' or 'liquid'.")
+    if Z - B <= 0:
+        raise ValueError(
+            "Invalid value of Z - B in entropy calculation."
+        )
 
-    numerator = Z + (1 + math.sqrt(2)) * B
-    denominator = Z + (1 - math.sqrt(2)) * B
+    # First contribution to entropy departure
+    S_first = R_J * math.log(Z - B)
 
-    if Z - B <= 0 or numerator <= 0 or denominator <= 0:
-        raise ValueError("Invalid values for entropy calculation.")
+    # Special expression for Van der Waals EOS.
+    # Its attraction parameter does not depend on temperature.
+    if abs(delta1 - delta2) < 1e-12:
+
+        return S_first
+
+    # General expression for PR, SRK and RK
+    numerator = Z + delta1 * B
+    denominator = Z + delta2 * B
+
+    if numerator <= 0 or denominator <= 0:
+        raise ValueError(
+            "Invalid logarithm argument in entropy calculation."
+        )
 
     log_term = math.log(numerator / denominator)
 
-    S_departure = R_J * (
-        math.log(Z - B)
-        + (daT_dT / (2 * math.sqrt(2) * b * R_BAR))
+    S_attraction = (
+        R_J
+        * da_dT
+        / (b * (delta1 - delta2) * R_BAR)
         * log_term
     )
+
+    S_departure = S_first + S_attraction
 
     return S_departure
 
 
-def calculate_entropy(gas, T, P, pvt_results, phase="vapor"):
+def calculate_entropy(
+    gas, T, P, pvt_results, phase="vapor", eos_model="PR"
+):
 
-    S_ideal = calculate_ideal_entropy(gas, T, P)
+    if T <= 0 or P <= 0:
+        raise ValueError(
+            "Temperature and pressure must be positive."
+        )
+
+    S_ideal = calculate_ideal_entropy(
+        gas, T, P
+    )
 
     S_departure = calculate_entropy_departure(
-        gas, T, P, pvt_results, phase
+        gas,
+        T,
+        P,
+        pvt_results,
+        phase,
+        eos_model
     )
 
     S_total = S_ideal + S_departure
@@ -96,6 +163,7 @@ def calculate_entropy(gas, T, P, pvt_results, phase="vapor"):
         "S_total": S_total
     }
 
+
 if __name__ == "__main__":
 
     gas = "methane"
@@ -105,27 +173,47 @@ if __name__ == "__main__":
 
     gas_properties = get_gas_properties(gas)
 
-    pvt_results = calculate_pvt(gas_properties, T, P)
+    eos_models = ["PR", "SRK", "RK", "VDW"]
 
-    results = calculate_entropy(
-        gas, T, P, pvt_results, phase="vapor"
-    )
+    for model in eos_models:
 
-    print("\n================================")
-    print("ENTROPY CALCULATION")
-    print("================================")
+        pvt_results = calculate_pvt(
+            gas_properties, T, P, model
+        )
 
-    print(f"\nGas: {get_gas_properties(gas)['name']}")
-    print(f"Temperature: {T} K")
-    print(f"Pressure: {P} bar")
+        results = calculate_entropy(
+            gas,
+            T,
+            P,
+            pvt_results,
+            phase="vapor",
+            eos_model=model
+        )
 
-    print("\nIDEAL GAS ENTROPY")
-    print(f"S ideal = {results['S_ideal']:.4f} J/(mol.K)")
+        print("\n================================")
+        print(model, "ENTROPY CALCULATION")
+        print("================================")
 
-    print("\nENTROPY DEPARTURE")
-    print(f"S departure = {results['S_departure']:.4f} J/(mol.K)")
+        print(f"\nGas: {gas_properties['name']}")
+        print(f"Temperature: {T} K")
+        print(f"Pressure: {P} bar")
 
-    print("\nTOTAL REAL GAS ENTROPY")
-    print(f"S total = {results['S_total']:.4f} J/(mol.K)")
+        print("\nIDEAL GAS ENTROPY")
 
-    print("\n================================")
+        print(
+            f"S ideal = {results['S_ideal']:.4f} J/(mol.K)"
+        )
+
+        print("\nENTROPY DEPARTURE")
+
+        print(
+            f"S departure = {results['S_departure']:.4f} J/(mol.K)"
+        )
+
+        print("\nTOTAL REAL GAS ENTROPY")
+
+        print(
+            f"S total = {results['S_total']:.4f} J/(mol.K)"
+        )
+
+        print("\n================================")
